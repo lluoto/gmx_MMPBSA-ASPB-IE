@@ -1,68 +1,3 @@
-# Fork modifications: Normal Cache Feature
-
-This fork adds **WT (wild-type) calculation caching** to gmx_MMPBSA for alanine scanning, avoiding redundant re-computation of the normal trajectory PB energy across different mutation runs.
-
-## Feature: `normal_cache`
-
-A new `&alanine_scanning` namelist parameter:
-
-```fortran
-normal_cache = 1,    # skip normal WT sander, parse results from disk
-```
-
-When enabled, `load_calc_list()` skips setting up normal (complex/receptor/ligand) sander calculations. The `mutant_only=0` path is still followed for the parsing phase, so ΔΔG (mutant − normal) output is preserved.
-
-## Supporting modifications
-
-Two additional patches protect the **parse-output** phase when `normal_cache=1` is active.  
-(gmx_MMPBSA's `file_setup()` clears scratch files before each run, including previous WT mdout files.)
-
-### 1. CopyCalc fallback (`calculation.py`)
-
-`CopyCalc.run()` copies normal receptor/ligand results to mutant when those topologies are unchanged. If the source normal file has been cleaned during `file_setup`, it now falls back to reading from a `.wt_cache_snapshot_backup/` directory in the working directory before failing.
-
-### 2. parse_output_files restore (`main.py`)
-
-`parse_output_files()` now checks if `normal_cache=1` is active and, before attempting to read normal WT mdout files, restores them from `.wt_cache_snapshot_backup/` if they are missing.
-
-## How to use
-
-1. **First run** (generates WT cache):
-   ```bash
-   mpirun -np 10 gmx_MMPBSA -i ala.in -cp topol.top ...
-   ```
-
-2. **Subsequent mutations** (reuse cached WT):
-   ```fortran
-   &alanine_scanning
-   mutant='ALA', mutant_res='A:126', cas_intdiel=1, normal_cache=1
-   /
-   ```
-
-A standalone runner (`vel_cache_runner.py`) that orchestrates the FULL → CACHE → CACHE workflow is also available (see usage notes in that file).
-
-## Install this fork
-
-This version is **not** on PyPI/conda-forge. Install directly from source:
-
-```bash
-git clone https://github.com/lluoto/gmx_MMPBSA.git
-cd gmx_MMPBSA
-pip install .
-```
-
-To upgrade an existing conda environment:
-
-```bash
-conda activate gmxMMPBSA
-pip install --upgrade --no-deps .
-```
-
----
-
-----------------------
-<br>
-
 [![Python](https://img.shields.io/badge/Python-v3.x-blue)]()
 [![Pypi](https://img.shields.io/pypi/v/gmx-MMPBSA)](https://pypi.org/project/gmx-MMPBSA/)
 [![Downloads](https://pepy.tech/badge/gmx-mmpbsa)](https://pepy.tech/project/gmx-mmpbsa)
@@ -119,3 +54,77 @@ Acknowledgements:
 - To all researchers who help improve gmx_MMPBSA with comments, feedback, and bug reports.
 
 ---------------------------------------
+
+# Fork modifications: Normal Cache Feature
+
+This fork adds **WT (wild-type) calculation caching** to gmx_MMPBSA for alanine scanning, avoiding redundant re-computation of the normal trajectory PB energy across different mutation runs.
+
+## Feature: `normal_cache`
+
+A new `&alanine_scanning` namelist parameter:
+
+```fortran
+normal_cache = 1,    # skip normal WT sander, parse results from disk
+```
+
+When enabled, `load_calc_list()` skips setting up normal (complex/receptor/ligand) sander calculations. The `mutant_only=0` path is still followed for the parsing phase, so ΔΔG (mutant − normal) output is preserved.
+
+## Supporting modifications
+
+Two additional patches protect the **parse-output** phase when `normal_cache=1` is active.  
+(gmx_MMPBSA's `file_setup()` clears scratch files before each run, including previous WT mdout files.)
+
+### 1. CopyCalc fallback (`calculation.py`)
+
+`CopyCalc.run()` copies normal receptor/ligand results to mutant when those topologies are unchanged. If the source normal file has been cleaned during `file_setup`, it now falls back to reading from a `.wt_cache_snapshot_backup/` directory in the working directory before failing.
+
+### 2. parse_output_files restore (`main.py`)
+
+`parse_output_files()` now checks if `normal_cache=1` is active and, before attempting to read normal WT mdout files, restores them from `.wt_cache_snapshot_backup/` if they are missing.
+
+## How to use
+
+1. **First run** (generates WT cache):
+   ```bash
+   mpirun -np 10 gmx_MMPBSA -i ala.in -cp topol.top ...
+   ```
+
+2. **Subsequent mutations** (reuse cached WT):
+   ```fortran
+   &alanine_scanning
+   mutant='ALA', mutant_res='A:126', cas_intdiel=1, normal_cache=1
+   /
+   ```
+
+## Cache validation
+
+The fingerprint stored in `.gmxmmpbsa_cache_info` includes:
+
+| Field | Source | Purpose |
+|---|---|---|
+| `traj`, `tpr`, `top`, `index`, `ref_pdb` | mtime + size of input files | Detect swapped/modified input files |
+| `ala_template` | mtime + size of `ala.in` | Detect input parameter changes |
+| **`startframe`** | parsed from `ala.in` | Catch frame-skip changes |
+| **`endframe`** | parsed from `ala.in` | Catch frame-skip changes |
+| `mpi_size` | runner setting | Detect MPI rank count changes |
+
+If any field differs between the saved fingerprint and the current system, the cache is invalidated and a new full WT calculation runs. This ensures the cached WT mdout files always match the same trajectory frame range as the requested mutation.
+
+A standalone runner (`vel_cache_runner.py`) that orchestrates the FULL → CACHE → CACHE workflow is also available (see usage notes in that file).
+
+## Install this fork
+
+This version is **not** on PyPI/conda-forge. Install directly from source:
+
+```bash
+git clone https://github.com/lluoto/gmx_MMPBSA-ASPB-IE.git
+cd gmx_MMPBSA-ASPB-IE
+pip install .
+```
+
+To upgrade an existing conda environment:
+
+```bash
+conda activate gmxMMPBSA
+pip install --upgrade --no-deps .
+```
