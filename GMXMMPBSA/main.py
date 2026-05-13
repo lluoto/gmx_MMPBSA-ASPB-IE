@@ -223,9 +223,11 @@ class MMPBSA_App(object):
             if (self.INPUT['pb']['pbrun'] or self.INPUT['rism']['rismrun'] or
                 self.INPUT['nmode']['nmoderun']) and self.mpi_size > 1:
                 logging.warning('PB/RISM/NMODE will be calculated with multiple threads, make sure you have enough RAM.')
-        if not self.INPUT['ala']['mutant_only']:
+        if not self.INPUT['ala']['mutant_only'] and not self.INPUT['ala'].get('normal_cache', 0):
             self.calc_list.append(PrintCalc('Running calculations on normal system...'), timer_key=None)
             self._load_calc_list(self.pre, False, self.normal_system)
+        if self.INPUT['ala'].get('normal_cache', 0):
+            self.calc_list.append(PrintCalc('Using cached normal results — skipping normal calculation...'), timer_key=None)
         if self.INPUT['ala']['alarun']:
             self.calc_list.append(PrintCalc('Running calculations on mutant system...'), timer_key=None)
             self._load_calc_list(f'{self.pre}', True, self.mutant_system)
@@ -718,8 +720,8 @@ class MMPBSA_App(object):
         if self.using_chamber:
             if INPUT['rism']['rismrun']:
                 GMXMMPBSA_ERROR('CHAMBER prmtops cannot be used with 3D-RISM')
-            # if INPUT['nmode']['nmoderun']:
-            #     GMXMMPBSA_ERROR('CHAMBER prmtops cannot be used with NMODE')
+            if INPUT['nmode']['nmoderun']:
+                GMXMMPBSA_ERROR('CHAMBER prmtops cannot be used with NMODE')
 
         self.normal_system.Map(INPUT['general']['receptor_mask'], INPUT['general']['ligand_mask'])
         self.normal_system.CheckConsistency()
@@ -1170,6 +1172,18 @@ class MMPBSA_App(object):
         if not self.master:
             return
         logging.info('Parsing results to output files...\n')
+        # If normal_cache=1, restore cached normal mdout files from
+        # .wt_cache_snapshot_backup/ so parse_output_files can read them.
+        if self.INPUT.get('ala', {}).get('normal_cache', 0):
+            import glob, os, shutil
+            _snap = os.path.join(os.getcwd(), '.wt_cache_snapshot_backup')
+            if os.path.isdir(_snap):
+                for _f in glob.glob(os.path.join(_snap, '*')):
+                    _dst = os.path.join(os.getcwd(), os.path.basename(_f))
+                    if not os.path.exists(_dst):
+                        shutil.copy2(_f, _dst)
+                        logging.info('Restored %%s from cache for parsing.', os.path.basename(_f))
+
         self.calc_types = SimpleNamespace(normal={}, mutant={}, mut_norm={}, decomp_normal={}, decomp_mutant={})
         INPUT, FILES = self.INPUT, self.FILES
         # Quasi-harmonic analysis is a special-case, so handle that separately
@@ -1263,7 +1277,7 @@ class MMPBSA_App(object):
                     self.calc_types.mut_norm[key]['delta'] = DeltaDeltaStatistics(
                         self.calc_types.mutant[key]['delta'], self.calc_types.normal[key]['delta'])
 
-        self.get_iec2entropy(from_calc)
+            self.get_iec2entropy(from_calc)
 
         if not hasattr(self, 'resl'):
             from GMXMMPBSA.utils import mask2list

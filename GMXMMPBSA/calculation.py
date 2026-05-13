@@ -32,6 +32,7 @@ Classes:
 #  for more details.                                                           #
 # ##############################################################################
 import logging
+import re
 import threading
 from pathlib import Path
 from tqdm import tqdm
@@ -43,12 +44,13 @@ from GMXMMPBSA.exceptions import GMXMMPBSA_ERROR
 from GMXMMPBSA.utils import mdout2json
 import os
 import sys
+import shutil
 import numpy as np
 import math
+from subprocess import Popen, PIPE, STDOUT
 
 
 TQDM_BAR_FORMAT = '            {l_bar}{bar}| {n_fmt}/{total_fmt} [elapsed: {elapsed} remaining: {remaining}]'
-
 
 def pb(output_basename, nframes=1, mpi_size=1, nmode=False):
     pbar = tqdm(total=nframes, ascii=True, bar_format=TQDM_BAR_FORMAT)
@@ -120,6 +122,7 @@ class CalculationList(list):
         except TypeError:
             f = stdout
         try:
+            background_calcs = []
             for i, calc in enumerate(self):
                 pb_thread = None
                 # Start timer, run calculation, then stop the timer
@@ -139,11 +142,24 @@ class CalculationList(list):
                         pb_thread.start()
 
                 calc.setup()
-                calc.run(rank, stdout=stdout, stderr=stderr)
+                
+                # Check if it's a background MD task
+                if isinstance(calc, BackgroundMDCalculation):
+                    calc.run(rank, stdout=stdout, stderr=stderr)
+                    background_calcs.append(calc) # Save it to check on later
+                else:
+                    # Run normal tasks sequentially
+                    calc.run(rank, stdout=stdout, stderr=stderr)
+                
                 if self.timer_keys[i] is not None:
                     self.timer.stop_timer(self.timer_keys[i])
                     if pb_thread:
                         pb_thread.join()
+            
+            # After all sequential (GPU) tasks are done, wait for background (CPU) tasks to finish
+            for bg_calc in background_calcs:
+                bg_calc.wait_for_completion()
+                
         finally:
             if own_handle: f.close()
 
@@ -330,6 +346,46 @@ class EnergyCalculation(Calculation):
 
         self.calc_setup = True
 
+class BackgroundMDCalculation(EnergyCalculation):
+    """
+    Runs an MD simulation in a background thread on the CPU while GPU 
+    calculations are happening in the main thread.
+    """
+    def __init__(self, prog, prmtop, incrd, inptraj, input_file, output, restrt, xvv=None):
+        super().__init__(prog, prmtop, incrd, inptraj, input_file, output, restrt, xvv)
+        self.md_thread = None
+        self.md_exception = None
+
+    def _run_in_thread(self, rank, stdout, stderr):
+        """Target method for the background thread."""
+        try:
+            # Call the parent class's run method inside the thread
+            super().run(rank, stdout=stdout, stderr=stderr)
+        except Exception as e:
+            # Capture any exception so we can raise it in the main thread later
+            self.md_exception = e
+
+    def run(self, rank, stdout=sys.stdout, stderr=sys.stderr):
+        """Starts the MD simulation in a background thread."""
+        if self.md_thread is not None and self.md_thread.is_alive():
+            raise CalcError("Background MD is already running!")
+            
+        self.md_exception = None
+        self.md_thread = threading.Thread(
+            target=self._run_in_thread, 
+            args=(rank, stdout, stderr),
+            daemon=True
+        )
+        logging.info(f"Starting background CPU MD simulation: {self.output}")
+        self.md_thread.start()
+
+    def wait_for_completion(self):
+        """Call this to block until the background MD finishes and check for errors."""
+        if self.md_thread is not None:
+            self.md_thread.join()
+            if self.md_exception:
+                raise self.md_exception
+            logging.info(f"Background CPU MD simulation completed: {self.output}")
 
 class ListEnergyCalculation(MultiCalculation):
     def __init__(self, prog, prmtop, input_file, incrds, outputs, xvv=None):
@@ -575,27 +631,94 @@ class PBEnergyCalculation(EnergyCalculation):
     prints to stdout and redirect them to the user
     """
 
+    def _format_ranked_value(self, value, rank):
+        value = str(value)
+        if '%d' in value:
+            value = value % rank
+        return value
+
+
+
+
     def run(self, rank, stdout=sys.stdout, stderr=sys.stderr):
-        """
-        Runs the program. All command-line arguments must be set before calling
-        this method. Command-line arguments should be set in setup()
-        stdout is ignored here because we need to parse it for errors
-        """
-        import re
-        from subprocess import Popen, PIPE
+        """ Runs every calculation in the list """
+        own_handle = False
+        try:
+            f = open(stdout, 'w')
+            own_handle = True
+        except TypeError:
+            f = stdout
+        try:
+            background_calcs = []
+            for i, calc in enumerate(self):
+                pb_thread = None
+                # Start timer, run calculation, then stop the timer
+                if self.timer_keys[i] is not None:
+                    self.timer.start_timer(self.timer_keys[i])
+                if self.labels[i] and rank == 0:
+                    logging.info(self.labels[i])
+                    if isinstance(calc, (EnergyCalculation, ListEnergyCalculation, NmodeCalc)):
+                        if isinstance(calc, (EnergyCalculation, ListEnergyCalculation)):
+                            nframes = self.nframes
+                            nmode = False
+                        else:
+                            nframes = self.nmframes
+                            nmode = True
+                        pb_thread = threading.Thread(target=pb, args=(self.output_files[i], nframes, self.mpi_size,
+                                                                      nmode), daemon=True)
+                        pb_thread.start()
+
+                calc.setup()
+                
+                # Check if it's a background MD task
+                if isinstance(calc, BackgroundMDCalculation):
+                    calc.run(rank, stdout=stdout, stderr=stderr)
+                    background_calcs.append(calc) # Save it to check on later
+                else:
+                    # Run normal tasks sequentially
+                    calc.run(rank, stdout=stdout, stderr=stderr)
+                
+                if self.timer_keys[i] is not None:
+                    self.timer.stop_timer(self.timer_keys[i])
+                    if pb_thread:
+                        pb_thread.join()
+            
+            # After all sequential (GPU) tasks are done, wait for background (CPU) tasks to finish
+            for bg_calc in background_calcs:
+                bg_calc.wait_for_completion()
+                
+        finally:
+            if own_handle: f.close()
+
+
+class MultiCalculation(object):
+    def __init__(self):
+        self.list_calc = []
+
+    def run(self, rank, stdout=sys.stdout, stderr=sys.stderr):
+        """ Runs the program. All command-line arguments must be set before
+                    calling this method. Command-line arguments should be set in setup()
+                """
+        from subprocess import Popen
 
         # If this has not been set up yet
         # then raise a stink
         if not self.calc_setup:
-            raise CalcError('Cannot run a calculation without calling its' +
-                            ' its setup() function!')
+            raise CalcError('Cannot run a calculation without calling its its setup() function!')
 
-        errorre = re.compile('(pb (?:bomb)|(?:warning))', re.I)
-        # Here, make sure that we could pass a file *OR* a string as stderr.
-        own_handle = False
+            # Here, make sure that we could pass a file *OR* a string as stdout/stderr.
+        # If they are strings, then open files up with that name, and make sure to
+        # close them afterwards. The setup() method should make sure that they are
+        # either a file or a string!
+        own_handleo = own_handlee = False
+        try:
+            process_stdout = open(stdout, 'w')
+            own_handleo = True
+        except TypeError:
+            process_stdout = stdout
         try:
             process_stderr = open(stderr, 'w')
-            own_handle = True
+            own_handlee = True
         except TypeError:
             process_stderr = stderr
 
@@ -604,8 +727,656 @@ class PBEnergyCalculation(EnergyCalculation):
         # process and monitor it for success.
 
         # Popen can only take strings as command-line arguments, so convert
-        # everything to a string here. If rank needs to be substituted in, do that
-        # here
+        # everything to a string here. And if it appears to need the rank
+        # substituted into the file name, substitute that in here
+        try:
+            for command_args in self.list_calc:
+                for i in range(len(command_args)):
+                    command_args[i] = str(command_args[i])
+                    if '%d' in command_args[i]:
+                        command_args[i] %= rank
+                process = Popen(command_args, stdin=None, stdout=process_stdout, stderr=process_stderr)
+                calc_failed = bool(process.wait())
+                if calc_failed:
+                    raise CalcError(f'{command_args[0]} failed with prmtop {command_args[1]}!')
+                # Each file of gbnsr6 with decomp is huge, so we need to reduce it. Here we transform the file to json
+                # to make it small
+                if 'gbnsr6' in command_args[0]:
+                    mdout2json(command_args)
+        finally:
+            if own_handleo: process_stdout.close()
+            if own_handlee: process_stdout.close()
+
+        # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def setup(self):
+        """ Sets up the Calculation. Finds the program and adds that to the
+            first element of the array. Inherited classes should call this
+            method first, but then do anything else that is necessary for that
+            calculation.
+        """
+        self.calc_setup = True
+
+
+class Calculation(object):
+    """ Base calculation class. All other calculation classes should be inherited
+        from this class.
+    """
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def __init__(self, prog, prmtop, incrd, inptraj, input_file, output, xvv=None):
+        self.prmtop = str(prmtop)
+        self.incrd = incrd
+        self.input_file = input_file
+        self.inptraj = inptraj
+        self.output = output
+        self.program = prog
+        self.xvv = xvv
+
+        self.calc_setup = False  # This means that the setup has run successfully
+
+        self.command_args = [self.program]
+
+    def run(self, rank, stdout=sys.stdout, stderr=sys.stderr):
+        """ Runs the program. All command-line arguments must be set before
+            calling this method. Command-line arguments should be set in setup()
+        """
+        from subprocess import Popen
+
+        # If this has not been set up yet
+        # then raise a stink
+        if not self.calc_setup:
+            raise CalcError('Cannot run a calculation without calling its' +
+                            ' its setup() function!')
+
+            # Here, make sure that we could pass a file *OR* a string as stdout/stderr.
+        # If they are strings, then open files up with that name, and make sure to
+        # close them afterwards. The setup() method should make sure that they are
+        # either a file or a string!
+        own_handleo = own_handlee = False
+        try:
+            process_stdout = open(stdout, 'w')
+            own_handleo = True
+        except TypeError:
+            process_stdout = stdout
+        try:
+            process_stderr = open(stderr, 'w')
+            own_handlee = True
+        except TypeError:
+            process_stderr = stderr
+
+        # The setup() method sets the command-line arguments and makes sure that
+        # all of the CL arguments are set. Now all we have to do is start the
+        # process and monitor it for success.
+
+        # Popen can only take strings as command-line arguments, so convert
+        # everything to a string here. And if it appears to need the rank
+        # substituted into the file name, substitute that in here
+        try:
+            for i in range(len(self.command_args)):
+                self.command_args[i] = str(self.command_args[i])
+                if '%d' in self.command_args[i]:
+                    self.command_args[i] %= rank
+
+            process = Popen(self.command_args, stdin=None, stdout=process_stdout, stderr=process_stderr)
+
+            calc_failed = bool(process.wait())
+
+            if calc_failed:
+                raise CalcError(f'{self.program} failed with prmtop {self.prmtop}!')
+        finally:
+            if own_handleo: process_stdout.close()
+            if own_handlee: process_stdout.close()
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def setup(self):
+        """ Sets up the Calculation. Finds the program and adds that to the
+            first element of the array. Inherited classes should call this
+            method first, but then do anything else that is necessary for that
+            calculation.
+        """
+        self.calc_setup = True
+
+
+class EnergyCalculation(Calculation):
+    """ Uses mmpbsa_py_energy to evaluate energies """
+
+    def __init__(self, prog, prmtop, incrd, inptraj, input_file, output, restrt, xvv=None):
+        Calculation.__init__(self, prog, prmtop, incrd, inptraj,
+                             input_file, output, xvv)
+        self.restrt = restrt
+
+    def setup(self):
+        """
+        Sets up the command-line arguments. Sander requires a unique restrt file
+        for the MPI version (since one is *always* written and you don't want 2
+        threads fighting to write the same dumb file)
+        """
+        self.command_args.append('-O')  # overwrite flag
+        self.command_args.extend(('-i', self.input_file))  # input file flag
+        self.command_args.extend(('-p', self.prmtop))  # prmtop flag
+        self.command_args.extend(('-c', self.incrd))  # input coordinate flag
+        self.command_args.extend(('-o', self.output))  # output file flag
+        if self.inptraj is not None:
+            self.command_args.extend(('-y', self.inptraj))  # input trajectory flag
+        if self.restrt is not None:
+            self.command_args.extend(('-r', self.restrt))  # restart file flag
+        if self.xvv is not None:
+            self.command_args.extend(('-xvv', self.xvv))  # xvv file flag
+
+        # Now test to make sure that the input file exists, since that's the only
+        # one that may be absent (due to the use of -use-mdins)
+        if not os.path.exists(self.input_file):
+            raise IOError("Input file (%s) doesn't exist" % self.input_file)
+
+        self.calc_setup = True
+
+class BackgroundMDCalculation(EnergyCalculation):
+    """
+    Runs an MD simulation in a background thread on the CPU while GPU 
+    calculations are happening in the main thread.
+    """
+    def __init__(self, prog, prmtop, incrd, inptraj, input_file, output, restrt, xvv=None):
+        super().__init__(prog, prmtop, incrd, inptraj, input_file, output, restrt, xvv)
+        self.md_thread = None
+        self.md_exception = None
+
+    def _run_in_thread(self, rank, stdout, stderr):
+        """Target method for the background thread."""
+        try:
+            # Call the parent class's run method inside the thread
+            super().run(rank, stdout=stdout, stderr=stderr)
+        except Exception as e:
+            # Capture any exception so we can raise it in the main thread later
+            self.md_exception = e
+
+    def run(self, rank, stdout=sys.stdout, stderr=sys.stderr):
+        """Starts the MD simulation in a background thread."""
+        if self.md_thread is not None and self.md_thread.is_alive():
+            raise CalcError("Background MD is already running!")
+            
+        self.md_exception = None
+        self.md_thread = threading.Thread(
+            target=self._run_in_thread, 
+            args=(rank, stdout, stderr),
+            daemon=True
+        )
+        logging.info(f"Starting background CPU MD simulation: {self.output}")
+        self.md_thread.start()
+
+    def wait_for_completion(self):
+        """Call this to block until the background MD finishes and check for errors."""
+        if self.md_thread is not None:
+            self.md_thread.join()
+            if self.md_exception:
+                raise self.md_exception
+            logging.info(f"Background CPU MD simulation completed: {self.output}")
+
+class ListEnergyCalculation(MultiCalculation):
+    def __init__(self, prog, prmtop, input_file, incrds, outputs, xvv=None):
+        super().__init__()
+        self.program = prog
+        self.prmtop = prmtop
+        self.incrds = incrds
+        self.input_file = input_file
+        self.outputs = outputs
+        self.xvv = xvv
+
+    def setup(self):
+        """
+        Sets up the command-line arguments. Sander requires a unique restrt file
+        for the MPI version (since one is *always* written and you don't want 2
+        threads fighting to write the same dumb file)
+        """
+        for c, o in zip(self.incrds, self.outputs):
+            command_args = [self.program,
+                            '-i', self.input_file,  # input file flag
+                            '-p', self.prmtop  # prmtop flag
+                            ]
+            command_args.extend(('-c', c))  # input coordinate flag
+            command_args.extend(('-o', o))  # output file flag
+            self.list_calc.append(command_args)
+
+            # Now test to make sure that the input file exists, since that's the only
+            # one that may be absent (due to the use of -use-mdins)
+            # if not os.path.exists(self.input_file):
+            #     raise IOError("Input file (%s) doesn't exist" % self.input_file)
+
+        self.calc_setup = True
+
+
+class RISMCalculation(Calculation):
+    """ This class handles RISM calculations """
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def __init__(self, prog, prmtop, incrd, inptraj, xvvfile, output, INPUT):
+        """ Sets up a RISM calculation. It's not as similar to the base class as
+            other calculation classes are, but it still inherits useful methods
+        """
+        # rism3d.snglpnt dumps its output to stdout
+        Calculation.__init__(self, prog, prmtop, incrd, inptraj, None, output)
+
+        # Set up instance variables
+        self.xvvfile = xvvfile
+        self.closure = ','.join(map(str, INPUT['rism']['closure']))
+        self.polardecomp = INPUT['rism']['polardecomp']
+        self.ng = ','.join(map(str, INPUT['rism']['ng']))
+        self.solvbox = ','.join(map(str, INPUT['rism']['solvbox']))
+        self.buffer = INPUT['rism']['buffer']
+        self.grdspc = ','.join(map(str, INPUT['rism']['grdspc']))
+        self.solvcut = INPUT['rism']['solvcut']
+        self.tolerance = ','.join(map(str, INPUT['rism']['tolerance']))
+        self.verbose = INPUT['rism']['rism_verbose']
+        self.solvbox = ','.join(map(str, INPUT['rism']['solvbox']))
+        self.gf = INPUT['rism']['rismrun_gf']
+
+        self.noasympcorr = INPUT['rism']['noasympcorr']
+        self.mdiis_del = INPUT['rism']['mdiis_del']
+        self.mdiis_restart = INPUT['rism']['mdiis_restart']
+        self.mdiis_nvec = INPUT['rism']['mdiis_nvec']
+        self.maxstep = INPUT['rism']['maxstep']
+        self.npropagate = INPUT['rism']['npropagate']
+        # self.centering = INPUT['rism']['centering']
+        # self.entropicDecomp = INPUT['rism']['entropicDecomp']
+        # self.pc_plus = INPUT['rism']['rismrun_pc+']
+        # self.uccoeff = ','.join(map(str, INPUT['rism']['uccoeff']))
+        self.treeDCF = INPUT['rism']['treeDCF']
+        self.treeTCF = INPUT['rism']['treeTCF']
+        self.treeCoulomb = INPUT['rism']['treeCoulomb']
+        self.treeDCFOrder = INPUT['rism']['treeDCFOrder']
+        self.treeTCFOrder = INPUT['rism']['treeTCFOrder']
+        self.treeCoulombOrder = INPUT['rism']['treeCoulombOrder']
+        self.treeDCFN0 = INPUT['rism']['treeDCFN0']
+        self.treeTCFN0 = INPUT['rism']['treeTCFN0']
+        self.treeCoulombN0 = INPUT['rism']['treeCoulombN0']
+        self.treeDCFMAC = INPUT['rism']['treeDCFMAC']
+        self.treeTCFMAC = INPUT['rism']['treeTCFMAC']
+        self.treeCoulombMAC = INPUT['rism']['treeCoulombMAC']
+        self.asympKSpaceTolerance = INPUT['rism']['asympKSpaceTolerance']
+        self.ljTolerance = INPUT['rism']['ljTolerance']
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def setup(self):
+        """ Sets up the RISM calculation. All it has to do is fill in the
+            necessary command-line arguments
+        """
+        # Set up some defaults
+        ngflag = self.ng != "-1,-1,-1"
+        solvboxflag = self.solvbox != "-1,-1,-1"
+        polardecompflag = bool(self.polardecomp)
+        gfflag = bool(self.gf)
+        # pc_plusflag = bool(self.pc_plus)
+
+        Calculation.setup(self)
+        self.command_args.extend(('--xvv', self.xvvfile,
+                                  '--closure', self.closure,
+                                  '--buffer', self.buffer,
+                                  '--grdspc', self.grdspc,
+                                  '--solvcut', self.solvcut,
+                                  '--tolerance', self.tolerance,
+                                  '--verbose', self.verbose,
+                                  '--prmtop', self.prmtop,
+                                  '--pdb', self.incrd,
+                                  '--traj', self.inptraj))
+        if ngflag:
+            self.command_args.extend(('--ng', self.ng))
+        if solvboxflag:
+            self.command_args.extend(('--solvbox', self.solvbox))
+        if polardecompflag:
+            self.command_args.extend(['--polarDecomp'])
+        if gfflag:
+            self.command_args.extend(['--gf'])
+        # if pc_plusflag:
+        #     self.command_args.extend(['--pc+'])
+        if not os.path.exists(self.xvvfile):
+            raise IOError('XVVFILE (%s) does not exist!' % self.xvvfile)
+
+        # additional variables
+        var_names = [self.mdiis_del, self.mdiis_restart, self.mdiis_nvec, self.maxstep, self.npropagate,
+                     self.treeDCF, self.treeTCF, self.treeCoulomb,
+                     self.treeDCFOrder, self.treeTCFOrder, self.treeCoulombOrder, self.treeDCFN0,
+                     self.treeTCFN0, self.treeCoulombN0, self.treeDCFMAC, self.treeTCFMAC, self.treeCoulombMAC,
+                     self.asympKSpaceTolerance, self.ljTolerance]
+
+        var_input_names = ['mdiis_del', 'mdiis_restart', 'mdiis_nvec', 'maxstep', 'npropagate',
+                           'treeDCF', 'treeTCF', 'treeCoulomb',
+                           'treeDCFOrder', 'treeTCFOrder', 'treeCoulombOrder', 'treeDCFN0', 'treeTCFN0',
+                           'treeCoulombN0', 'treeDCFMAC', 'treeTCFMAC', 'treeCoulombMAC',
+                           'asympKSpaceTolerance', 'ljTolerance']
+
+        for i in zip(var_names, var_input_names):
+            if i[1] not in ['treeDCF', 'treeTCF', 'treeCoulomb']:
+                self.command_args.extend((f'--{i[1]}', str(i[0])))
+            elif i[0] != 0:
+                self.command_args.extend([f'--{i[1]}'])
+
+        self.calc_setup = True
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def run(self, rank, *args, **kwargs):
+        Calculation.run(self, rank, stdout=self.output % rank)
+
+
+class NmodeCalc(Calculation):
+    """ Calculates entropy contribution by normal mode approximation """
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def __init__(self, prog, prmtop, incrd, inptraj, output, INPUT):
+        """ Initializes the nmode calculation. Need to set the options string """
+        from math import sqrt
+        Calculation.__init__(self, prog, prmtop, incrd, inptraj, None, output)
+
+        kappa = sqrt(0.10806 * INPUT['nmode']['nmode_istrng'])
+        if INPUT['nmode']['nmode_igb']:
+            option_string = ('ntpr=10000, diel=C, kappa=%f, cut=1000, gb=1, ' +
+                             'dielc=%f, temp0=%f') % (kappa, INPUT['nmode']['dielc'], INPUT['general']['temperature'])
+        else:
+            option_string = ('ntpr=10000, diel=R, kappa=%f, cut=1000, gb=0, ' +
+                             'dielc=%f, temp0=%f') % (kappa, INPUT['nmode']['dielc'], INPUT['general']['temperature'])
+
+        self.option_string = option_string
+        self.drms = INPUT['nmode']['drms']
+        self.maxcyc = INPUT['nmode']['maxcyc']
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def setup(self):
+        """ Sets up the simulation """
+
+        self.command_args.extend((self.incrd, self.prmtop, self.maxcyc, self.drms,
+                                  self.option_string, self.inptraj))
+        self.calc_setup = True
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def run(self, rank, *args, **kwargs):
+        Calculation.run(self, rank, stdout=self.output % rank)
+
+
+class QuasiHarmCalc(Calculation):
+    """ Quasi-harmonic entropy calculation class """
+
+    def __init__(self, prog, prmtop, inptraj, input_file, output,
+                 receptor_mask, ligand_mask, fnpre):
+        """ Initializes the Quasi-harmonic calculation class """
+        Calculation.__init__(self, prog, prmtop, None, inptraj,
+                             input_file, output)
+        self.stability = not bool(receptor_mask) and not bool(ligand_mask)
+        self.receptor_mask, self.ligand_mask = receptor_mask, ligand_mask
+        self.calc_setup = False
+        self.fnpre = fnpre  # file name prefix
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def setup(self):
+        """ Sets up a Quasi-harmonic calculation """
+        from subprocess import Popen, PIPE
+
+        # Determine the prefix from our input file... hack way to do this
+        if self.input_file.startswith(self.fnpre + 'mutant_'):
+            prefix = self.fnpre + 'mutant_'
+        else:
+            prefix = self.fnpre
+
+        # Make sure masks are a list, and that there are enough masks
+
+        # First thing we need is the average PDB as a reference
+        ptraj_str = 'trajin %s\naverage %savgcomplex.pdb pdb chainid " "\ngo' % (self.inptraj,
+                                                                                 prefix)
+
+        outfile = open(self.fnpre + 'create_average.out', 'w')
+
+        process = Popen([self.program, self.prmtop], stdin=PIPE, stdout=outfile)
+        out, err = process.communicate(ptraj_str.encode())
+
+        if process.wait():
+            raise CalcError('Failed creating average PDB')
+
+        outfile.close()
+
+        # Now that we have the PDB file
+
+        self.command_args.extend((self.prmtop, self.input_file))
+
+        self.calc_setup = True
+
+    # -#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+    def run(self, rank, *args, **kwargs):
+        Calculation.run(self, rank, stdout=self.output)
+
+
+class PBEnergyCalculation(EnergyCalculation):
+    """
+    Specially handle the PB calculations to extract warnings and errors PBSA
+    prints to stdout and redirect them to the user
+    """
+
+    def _format_ranked_value(self, value, rank):
+        value = str(value)
+        if '%d' in value:
+            value = value % rank
+        return value
+
+
+
+    def _should_use_hybrid_mutant_pb(self, rank):
+        if os.getenv('GMXMMPBSA_HYBRID_DISABLE', '0') == '1':
+            return False
+        input_file = self._format_ranked_value(self.input_file, rank)
+        output_file = self._format_ranked_value(self.output, rank)
+        inptraj_file = self._format_ranked_value(self.inptraj, rank)
+        return (os.path.basename(str(self.program)) == 'sander' and
+                'mutant_' in os.path.basename(output_file) and
+                os.path.basename(input_file) in ('_GMXMMPBSA_pb.mdin', '_GMXMMPBSA_pb.mdin2', 'pb.mdin', 'pb.mdin2') and
+                '.mdcrd' in os.path.basename(inptraj_file) and
+                self._hybrid_pmemd_path() is not None and
+                self._hybrid_cpptraj_path() is not None)
+
+    def _replace_or_add_cntrl_value(self, text, key, value):
+        pattern = re.compile(r'(%s\s*=\s*)([^,\n/]+)' % re.escape(key), re.I)
+        if pattern.search(text):
+            return pattern.sub(lambda match: match.group(1) + str(value), text)
+        cntrl_match = re.search(r'(&cntrl\s*)(.*?)(\n/)', text, re.I | re.S)
+        if not cntrl_match:
+            return text
+        block = cntrl_match.group(2).rstrip() + ('\n ' if not cntrl_match.group(2).endswith('\n') else ' ')
+        block += '%s=%s,' % (key, value)
+        return text[:cntrl_match.start(2)] + block + text[cntrl_match.end(2):]
+
+    def _strip_cntrl_key(self, text, key):
+        return re.sub(r'\b%s\s*=\s*[^,\n/]+,?\s*' % re.escape(key), '', text, flags=re.I)
+
+    def _build_min_input(self, source_text):
+        out_lines = []
+        in_pb = False
+        for line in source_text.splitlines(True):
+            low = line.lstrip().lower()
+            if low.startswith('&pb'):
+                in_pb = True
+                continue
+            if in_pb:
+                if line.strip() == '/':
+                    in_pb = False
+                continue
+            out_lines.append(line)
+        text = ''.join(out_lines)
+        text = self._strip_cntrl_key(text, 'ipb')
+        text = self._strip_cntrl_key(text, 'dec_verbose')
+        text = self._replace_or_add_cntrl_value(text, 'imin', '1')
+        text = self._replace_or_add_cntrl_value(text, 'igb', '5')
+        text = self._replace_or_add_cntrl_value(text, 'maxcyc', '1')
+        text = self._replace_or_add_cntrl_value(text, 'ncyc', '0')
+        return text
+
+    def _build_pb_zero_input(self, source_text):
+        text = self._replace_or_add_cntrl_value(source_text, 'maxcyc', '0')
+        text = self._replace_or_add_cntrl_value(text, 'ncyc', '0')
+        return text
+
+    def _split_mdcrd_frames(self, mdcrd_file, prmtop_file, temp_dir, prefix):
+        import parmed
+        parm = parmed.load_file(prmtop_file)
+        natom = len(parm.atoms)
+        coords_per_frame = natom * 3
+        with open(mdcrd_file, 'r') as handle:
+            title = handle.readline().rstrip('\n')
+            words = handle.read().split()
+        if coords_per_frame == 0 or len(words) < coords_per_frame:
+            raise CalcError('Hybrid mutant PB requires a readable mdcrd with at least one frame')
+        if len(words) % coords_per_frame != 0:
+            raise CalcError('Hybrid mutant PB only supports mdcrd trajectories without box data')
+        frame_files = []
+        for idx in range(len(words) // coords_per_frame):
+            frame_path = os.path.join(temp_dir, '%s.frame%04d.mdcrd' % (prefix, idx + 1))
+            frame_values = words[idx * coords_per_frame:(idx + 1) * coords_per_frame]
+            with open(frame_path, 'w') as out_handle:
+                out_handle.write(title + '\n')
+                for start in range(0, len(frame_values), 10):
+                    chunk = frame_values[start:start + 10]
+                    out_handle.write(''.join('%8.3f' % float(value) for value in chunk) + '\n')
+            frame_files.append(frame_path)
+        return frame_files
+
+    def _run_checked(self, command_args, stderr_handle, failure_message):
+        from subprocess import Popen, PIPE
+        cmd = [str(arg) for arg in command_args]
+        logging.info('Hybrid mutant PB command: %s', ' '.join(cmd))
+        process = Popen(cmd, stdin=None, stdout=PIPE, stderr=stderr_handle)
+        out, err = process.communicate(b'')
+        if process.wait():
+            try:
+                decoded = out.decode()
+            except AttributeError:
+                decoded = out
+            except UnicodeDecodeError:
+                decoded = out.decode(errors='ignore')
+            raise CalcError('%s\n%s' % (failure_message, decoded))
+        return out
+
+    def _restart_to_mdcrd(self, cpptraj, prmtop_file, restart_file, mdcrd_file, stderr_handle):
+        from subprocess import Popen, PIPE
+        command = 'trajin %s\ntrajout %s nobox\ngo\n' % (restart_file, mdcrd_file)
+        logging.info('Hybrid mutant PB restart->mdcrd: %s -> %s', restart_file, mdcrd_file)
+        process = Popen([cpptraj, prmtop_file], stdin=PIPE, stdout=PIPE, stderr=stderr_handle)
+        out, err = process.communicate(command.encode())
+        if process.wait():
+            raise CalcError('Failed converting restart %s back into mdcrd for hybrid mutant PB\n%s' %
+                            (restart_file, out.decode(errors='ignore')))
+
+
+    def _mdcrd_to_restart(self, cpptraj, prmtop_file, mdcrd_file, restart_file, stderr_handle):
+        from subprocess import Popen, PIPE
+        command = 'trajin %s 1 1 1\ntrajout %s restart\ngo\n' % (mdcrd_file, restart_file)
+        logging.info('Hybrid mutant PB mdcrd->restart: %s -> %s', mdcrd_file, restart_file)
+        process = Popen([cpptraj, prmtop_file], stdin=PIPE, stdout=PIPE, stderr=stderr_handle)
+        out, err = process.communicate(command.encode())
+        if process.wait():
+            raise CalcError('Failed converting mdcrd %s into restart for hybrid mutant PB\n%s' %
+                            (mdcrd_file, out.decode(errors='ignore')))
+
+    def _run_hybrid_mutant_pb(self, rank, stderr):
+        input_file = self._format_ranked_value(self.input_file, rank)
+        output_file = self._format_ranked_value(self.output, rank)
+        inptraj_file = self._format_ranked_value(self.inptraj, rank)
+        incrd_file = self._format_ranked_value(self.incrd, rank)
+        restrt_file = self._format_ranked_value(self.restrt, rank) if self.restrt is not None else None
+        pmemd = self._hybrid_pmemd_path()
+        cpptraj = self._hybrid_cpptraj_path()
+        if pmemd is None or cpptraj is None:
+            raise CalcError('Hybrid mutant PB requested but pmemd.cuda/cpptraj is unavailable')
+        logging.info('Hybrid mutant PB activated for %s using %s', output_file, pmemd)
+        own_handle = False
+        try:
+            try:
+                process_stderr = open(stderr, 'w')
+                own_handle = True
+            except TypeError:
+                process_stderr = stderr
+
+            with open(input_file, 'r') as handle:
+                source_text = handle.read()
+
+            output_dir = os.path.dirname(output_file) or '.'
+            base_name = os.path.basename(output_file).replace('.mdout', '')
+            temp_dir = os.path.join(output_dir, base_name + '.hybrid_tmp')
+            os.makedirs(temp_dir, exist_ok=True)
+
+            min_input = os.path.join(temp_dir, 'hybrid_min.mdin')
+            pb_input = os.path.join(temp_dir, 'hybrid_pb.mdin')
+            with open(min_input, 'w') as handle:
+                handle.write(self._build_min_input(source_text))
+            with open(pb_input, 'w') as handle:
+                handle.write(self._build_pb_zero_input(source_text))
+
+            frame_files = self._split_mdcrd_frames(inptraj_file, self.prmtop, temp_dir, base_name)
+            if not frame_files:
+                raise CalcError('Hybrid mutant PB could not split any frames from %s' % inptraj_file)
+            logging.info('Hybrid mutant PB split %d frame(s) from %s', len(frame_files), inptraj_file)
+
+            last_restart = None
+            open(output_file, 'w').close()
+
+            for idx, frame_file in enumerate(frame_files, 1):
+                start_restart = os.path.join(temp_dir, 'frame%04d.start.rst7' % idx)
+                min_mdout = os.path.join(temp_dir, 'frame%04d.min.mdout' % idx)
+                min_restart = os.path.join(temp_dir, 'frame%04d.min.rst' % idx)
+                pb_mdcrd = os.path.join(temp_dir, 'frame%04d.pb.mdcrd' % idx)
+                pb_mdout = os.path.join(temp_dir, 'frame%04d.pb.mdout' % idx)
+                pb_restart = os.path.join(temp_dir, 'frame%04d.pb.rst' % idx)
+
+                self._mdcrd_to_restart(cpptraj, self.prmtop, frame_file, start_restart, process_stderr)
+
+                self._run_checked([pmemd, '-O', '-i', min_input,
+                                   '-p', self.prmtop, '-c', start_restart, '-o', min_mdout,
+                                   '-r', min_restart], process_stderr,
+                                  'pmemd.cuda failed during hybrid mutant PB frame %d' % idx)
+
+                self._restart_to_mdcrd(cpptraj, self.prmtop, min_restart, pb_mdcrd, process_stderr)
+
+                self._run_checked([self.program, '-O', '-i', pb_input,
+                                   '-p', self.prmtop, '-c', min_restart,
+                                   '-y', pb_mdcrd, '-o', pb_mdout,
+                                   '-r', pb_restart], process_stderr,
+                                  'sander PB stage failed during hybrid mutant PB frame %d' % idx)
+
+                with open(output_file, 'ab') as final_handle, open(pb_mdout, 'rb') as frame_handle:
+                    shutil.copyfileobj(frame_handle, final_handle)
+                last_restart = pb_restart if os.path.exists(pb_restart) else min_restart
+
+            if restrt_file is not None and last_restart is not None:
+                shutil.copyfile(last_restart, restrt_file)
+        finally:
+            if own_handle:
+                process_stderr.close()
+
+    def run(self, rank, stdout=sys.stdout, stderr=sys.stderr):
+        """
+        Runs the program. All command-line arguments must be set before calling
+        this method. Command-line arguments should be set in setup()
+        stdout is ignored here because we need to parse it for errors
+        """
+        # If this has not been set up yet
+        # then raise a stink
+        if not self.calc_setup:
+            raise CalcError('Cannot run a calculation without calling its' +
+                            ' its setup() function!')
+
+
+        errorre = re.compile('(pb (?:bomb)|(?:warning))', re.I)
+        own_handle = False
+        try:
+            process_stderr = open(stderr, 'w')
+            own_handle = True
+        except TypeError:
+            process_stderr = stderr
+
         try:
             for i in range(len(self.command_args)):
                 self.command_args[i] = str(self.command_args[i])
@@ -629,7 +1400,6 @@ class PBEnergyCalculation(EnergyCalculation):
                                 CalcError)
         finally:
             if own_handle: process_stderr.close()
-
 
 class SurfCalc(Calculation):
     """
@@ -722,6 +1492,18 @@ class CopyCalc(Calculation):
             final_name = self.final_name % rank
         else:
             final_name = self.final_name
+
+        # If orig_name does not exist (e.g. normal WT files deleted during
+        # file_setup in normal_cache=1 mode), restore it from the snapshot
+        # backup directory created by the external batch runner.
+        if not os.path.exists(orig_name):
+            cache_dir = os.path.join(
+                os.path.dirname(os.path.abspath(orig_name)) or '.',
+                '.wt_cache_snapshot_backup')
+            cached = os.path.join(cache_dir, os.path.basename(orig_name))
+            if os.path.exists(cached):
+                import shutil
+                shutil.copy2(cached, orig_name)
 
         copy(orig_name, final_name)
 
