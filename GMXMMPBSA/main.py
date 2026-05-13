@@ -1182,7 +1182,7 @@ class MMPBSA_App(object):
                     _dst = os.path.join(os.getcwd(), os.path.basename(_f))
                     if not os.path.exists(_dst):
                         shutil.copy2(_f, _dst)
-                        logging.info('Restored %%s from cache for parsing.', os.path.basename(_f))
+                        logging.info('Restored %s from cache for parsing.', os.path.basename(_f))
 
         self.calc_types = SimpleNamespace(normal={}, mutant={}, mut_norm={}, decomp_normal={}, decomp_mutant={})
         INPUT, FILES = self.INPUT, self.FILES
