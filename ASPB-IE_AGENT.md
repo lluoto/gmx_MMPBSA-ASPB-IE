@@ -511,7 +511,58 @@ pip install --upgrade --no-deps git+https://github.com/lluoto/gmx_MMPBSA-ASPB-IE
 
 ---
 
-## 8. 输出/日志诊断
+## 8. 性能基准测试 (Benchmark)
+
+### 8.1 测试目的
+
+确定给定系统的最优 MPI 并行数 (`-np`) 和 PB `fillratio` 参数。
+`fillratio` 控制 PB 有限差分网格密度：值越大网格越密，精度越高但内存占用更大。
+
+**经验法则**：
+- `fillratio=1.0-1.25`：中等精度，适合大多数体系
+- `fillratio=1.5-2.0`：高精度，大体系需要更大内存
+- `fillratio>2.0`：仅当对静电计算精度要求极高时使用
+
+### 8.2 运行基准测试
+
+```bash
+# 自动测试 fillratio × MPI 组合
+python wt_scan.py \
+    --topol topol.top --tpr md.tpr --traj md.xtc \
+    --index index.ndx --cg "1 13" --cr ref.pdb \
+    --prefix bench --endframe 5 \
+    --benchmark \
+    --benchmark-mpi "1,2,4,8" \
+    --benchmark-fillratio "1.0,1.25,1.5"
+```
+
+### 8.3 实测结果 (vel 系统，~1MB prmtop)
+
+| MPI | fillratio | 耗时 (s) | 说明 |
+|-----|-----------|----------|------|
+| 1 | 1.25 | 1.555 | 单核基线 |
+| **2** | 1.25 | **0.869** | ✅ **最优** — 比单核快 44% |
+| 4 | 1.25 | 0.919 | MPI 开销抵消并行增益 |
+| 5 | 1.25 | 0.978 | 更多核 → 更慢（网格太小） |
+
+**结论**：小体系（< 1000 原子）建议 `-np 2`，大体系（> 5000 原子）建议 `-np 8`。
+推荐使用 `--benchmark` 为每个新体系找到最优配置。
+
+### 8.4 内存估算
+
+`fillratio` 直接影响 PB 求解器的内存占用：
+
+```
+近似网格点数 ∝ fillratio³ × 体系尺寸
+```
+
+每 MPI 秩的内存 ≈ 总网格点数 / MPI 秩数 × 每点字节数
+
+对于 20MB prmtop 的体系（0082），`fillratio=1.25` 配合 `-np 5` 大约消耗 6-8GB/rank。若出现 OOM，降低 `fillratio` 或增加 `-np`。
+
+---
+
+## 9. 输出/日志诊断
 
 ### 8.1 成功标志
 
@@ -576,7 +627,31 @@ Runner 日志:
 
 ---
 
-## 11. 参考链接
+## 11. 两种工作模式
+
+ASPB-IE Agent 支持两种交互模式：
+
+### 11.1 模式 A: Web 引导模式
+
+用于**新用户首次使用**或**在新环境部署**。Agent 以问答形式引导用户完成：
+1. 环境检查（conda env、AmberTools、GROMACS 版本）
+2. 输入文件准备（topol, tpr, xtc, index, ref.pdb）
+3. 参数配置（fillratio, MPI 并行数, 膜参数）
+4. 运行并解释输出
+
+### 11.2 模式 B: Runner 部署模式
+
+用于**已配置好的工作目录**或**已有 runner 脚本**。Agent 直接：
+1. 检测 `vel_cache_runner.py` / `v5_mmpbsa_cal.py` / `wt_scan.py` 是否存在
+2. 检查 Chain ID、ndx 组索引、cache 指纹一致性
+3. 在用户授权后直接执行计算
+4. 监控进度并返回 ΔΔG 结果
+
+两种模式的选择由 Agent 根据用户提供的上下文自动决定。如果用户提供了工作目录和 runner 脚本路径 → 模式 B；如果用户询问概念/安装 → 模式 A。
+
+---
+
+## 12. 参考链接
 
 - [gmx_MMPBSA GitHub](https://github.com/Valdes-Tresanco-MS/gmx_MMPBSA)
 - [ASPB-IE Fork](https://github.com/lluoto/gmx_MMPBSA-ASPB-IE)

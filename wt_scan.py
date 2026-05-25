@@ -61,9 +61,9 @@ WT per-residue decomposition scan (ASPB-IE Phase 1)
 /
 &pb
   istrng=0.15
-  inp=1
+  inp={inp}
   radiopt=0
-/
+{fillratio_line}{mem_line}/
 &decomp
   idecomp=1
   csv_format=1
@@ -72,29 +72,102 @@ WT per-residue decomposition scan (ASPB-IE Phase 1)
 
 
 # ---------------------------------------------------------------------------
+# Membrane parameter group (optional)
+# ---------------------------------------------------------------------------
+MEMBRANE_PARAMS = {
+    'memopt':   {'type': int,   'default': 0,     'help': 'Implicit membrane (0=off, 1=on)'},
+    'emem':     {'type': float, 'default': 7.0,   'help': 'Membrane dielectric constant'},
+    'indi':     {'type': float, 'default': 4.0,   'help': 'Membrane interior dielectric'},
+    'exdi':     {'type': float, 'default': 80.0,  'help': 'Membrane exterior dielectric'},
+    'mctrdz':   {'type': float, 'default': 20.0,  'help': 'Membrane center Z coordinate (A)'},
+    'mthick':   {'type': float, 'default': 32.4,  'help': 'Membrane thickness (A)'},
+    'poretype': {'type': int,   'default': 1,     'help': 'Pore type (1=cylindrical)'},
+}
+MEMBRANE_PARAM_KEYS = list(MEMBRANE_PARAMS.keys())
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="ASPB-IE Phase 1: WT per-residue decomposition scan")
+
+    # Required
     p.add_argument("--topol",  required=True, help="GROMACS topology file")
     p.add_argument("--tpr",    required=True, help="GROMACS TPR file")
     p.add_argument("--traj",   required=True, help="GROMACS trajectory (XTC/TRR)")
     p.add_argument("--index",  required=True, help="GROMACS index file")
     p.add_argument("--cg",     required=True, help="Complex groups, e.g. '1 13'")
     p.add_argument("--cr",     required=True, help="Reference PDB file")
+
+    # Frame control
     p.add_argument("--startframe", type=int, default=1, help="First frame")
     p.add_argument("--endframe",   type=int, default=0, help="Last frame (0 = all)")
+
+    # Output control
     p.add_argument("--prefix",     default=DEFAULT_PREFIX, help="Output prefix")
     p.add_argument("--top-n",      type=int, default=DEFAULT_TOP_N,
                     help=f"Number of top hotspot candidates (default: {DEFAULT_TOP_N})")
     p.add_argument("--threshold",  type=float, default=DEFAULT_THRESHOLD,
                     help=f"Energy threshold in kcal/mol (default: {DEFAULT_THRESHOLD})")
-    p.add_argument("--mpi",  type=int, default=DEFAULT_MPI, help="MPI processes")
     p.add_argument("--workdir", default=".", help="Working directory")
     p.add_argument("--no-run", action="store_true",
                    help="Only generate input file, do not run gmx_MMPBSA")
+
+    # PB control
+    p.add_argument("--mpi",       type=int, default=DEFAULT_MPI, help="MPI processes")
+    p.add_argument("--fillratio", type=float, default=1.25,
+                    help="PB fill ratio (grid spacing). Higher=more accurate but more memory (default: 1.25)")
+    p.add_argument("--inp",       type=int, default=2, choices=[1, 2],
+                    help="PB input option: 1=periodic solvent, 2=periodic + membrane capable (default: 2)")
+
+    # Chain ID (auto-detected from PDB if not specified)
+    p.add_argument("--chain", default=None,
+                    help="Chain ID for mutations (auto-detected from ref.pdb if omitted)")
+
+    # Membrane (implicit membrane PB)
+    mem_group = p.add_argument_group("Membrane PB (implicit solvent membrane)")
+    for k, v in MEMBRANE_PARAMS.items():
+        mem_group.add_argument(f"--{k}", type=v['type'], default=None,
+                               help=f"{v['help']} (default: {v['default']})")
+
+    # Benchmark
+    p.add_argument("--benchmark", action="store_true",
+                    help="Run performance benchmark: test fillratio x MPI combinations")
+    p.add_argument("--benchmark-mpi", default="1,2,4,8",
+                    help="MPI counts to test in benchmark (comma-separated, default: 1,2,4,8)")
+    p.add_argument("--benchmark-fillratio", default="1.0,1.25,1.5",
+                    help="Fillratio values to test (comma-separated, default: 1.0,1.25,1.5)")
+
     return p.parse_args(argv)
+
+
+
+# ---------------------------------------------------------------------------
+# Chain ID auto-detection
+# ---------------------------------------------------------------------------
+def detect_chain_id(ref_pdb: str) -> str:
+    """Read first few atoms from PDB and extract chain ID."""
+    chains = set()
+    with open(ref_pdb) as f:
+        for line in f:
+            if line.startswith('ATOM') or line.startswith('HETATM'):
+                chain = line[21:22].strip()
+                if chain:
+                    chains.add(chain)
+                if len(chains) > 1:
+                    break
+    if not chains:
+        print("[WARN] No chain ID found in PDB, defaulting to 'A'")
+        return 'A'
+    if len(chains) == 1:
+        return chains.pop()
+    # Multiple chains — prefer A or the first
+    print(f"[WARN] Multiple chains {chains} in PDB. Using 'A'. "
+          f"Specify --chain explicitly if needed.")
+    return 'A'
+
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +178,28 @@ def make_input(args) -> str:
     endframe_line = ""
     if args.endframe and args.endframe > 0:
         endframe_line = f"endframe={args.endframe},\n"
+
+    fillratio_line = f"  fillratio={args.fillratio},\n"
+
+    # Build membrane params line
+    mem_parts = []
+    for k in MEMBRANE_PARAM_KEYS:
+        v = getattr(args, k, None)
+        if v is not None:
+            # Use the actual membrane param default if matching, else use user value
+            if k == 'memopt' and v == 0:
+                continue  # skip if membrane is off
+            mem_parts.append(f"{k}={v}")
+    mem_line = ""
+    if mem_parts:
+        mem_line = "  " + ", ".join(mem_parts) + ",\n"
+
     text = DECOMP_INPUT_TEMPLATE.format(
         startframe=args.startframe,
         endframe_line=endframe_line,
+        inp=args.inp,
+        fillratio_line=fillratio_line,
+        mem_line=mem_line,
     )
     path = Path(args.workdir) / f"{args.prefix}_decomp.in"
     path.write_text(text)
@@ -124,8 +216,23 @@ def run_decomp(args, inp_path: str):
     out_csv = Path(args.workdir) / f"{args.prefix}_binding.csv"
     out_do  = Path(args.workdir) / f"{args.prefix}_decomp.dat"
 
+    # Try to find mpirun (conda env path or default PATH)
+    mpirun = 'mpirun'
+    for candidate in ['/home/ajsali/.conda/envs/gmxMMPBSA/bin/mpirun',
+                      os.path.expanduser('~/conda/envs/gmxMMPBSA/bin/mpirun')]:
+        if os.path.isfile(candidate):
+            mpirun = candidate
+            break
+
+    gmx_bin = 'gmx_MMPBSA'
+    for candidate in ['/home/ajsali/.conda/envs/gmxMMPBSA/bin/gmx_MMPBSA',
+                      os.path.expanduser('~/conda/envs/gmxMMPBSA/bin/gmx_MMPBSA')]:
+        if os.path.isfile(candidate):
+            gmx_bin = candidate
+            break
+
     cmd = (
-        f"mpirun -np {args.mpi} gmx_MMPBSA "
+        f"{mpirun} -np {args.mpi} {gmx_bin} "
         f"-i {inp_path} "
         f"-cp {args.topol} -cs {args.tpr} -ct {args.traj} "
         f"-ci {args.index} -cg {args.cg} -cr {args.cr} "
@@ -288,6 +395,9 @@ def write_ala_template(hotspots: list[dict], prefix: str, workdir: str):
         "#   then edit vel_cache_runner.py SITES = [" + ",".join(str(r['resnum']) for r in hotspots[:3]) + ("..." if len(hotspots) > 3 else "") + "]",
         "#   and run: python vel_cache_runner.py",
         "",
+        "# To customize PB parameters (fillratio, membrane, etc.):",
+        "# edit the &pb section below or use wt_scan.py --fillratio --memopt etc.",
+        "",
         "&general",
         "  sys_name='ASPB-IE'",
         "  startframe=1",
@@ -295,15 +405,71 @@ def write_ala_template(hotspots: list[dict], prefix: str, workdir: str):
         "  verbose=1",
         "/",
         "&pb",
-        "  istrng=0.15",
-        "  inp=1",
-        "  radiopt=0",
+        "  radiopt=0, istrng=0.150, fillratio=1.25, inp=2,",
+        "  sasopt=0, solvopt=2, ipb=1, bcopt=10, nfocus=1, linit=1000,",
+        "  eneopt=1, cutfd=7.0, cutnb=8.0, maxarcdot=15000, npbverb=1,",
         "/",
     ])
 
     path = Path(workdir) / f"{prefix}_hotspots.ala"
     path.write_text('\n'.join(lines) + '\n')
     print(f"[OUT] {path}  ({len(hotspots)} hotspot sites)")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark runner
+# ---------------------------------------------------------------------------
+def run_benchmark(args):
+    """Run multiple gmx_MMPBSA calls varying fillratio and MPI count to find
+    the fastest configuration. Reports wall time for each combo."""
+    mpi_values = [int(x.strip()) for x in args.benchmark_mpi.split(',') if x.strip()]
+    fr_values  = [float(x.strip()) for x in args.benchmark_fillratio.split(',') if x.strip()]
+
+    print("=" * 70)
+    print("  ASPB-IE Performance Benchmark")
+    print("  Testing fillratio x MPI combinations...")
+    print(f"  MPI:        {mpi_values}")
+    print(f"  Fillratio:  {fr_values}")
+    print(f"  System:     {args.traj} ({args.topol})")
+    print("=" * 70)
+
+    results = []
+    for mpi in mpi_values:
+        for fr in fr_values:
+            print(f"\n--- Testing MPI={mpi}, fillratio={fr} ---")
+            args.mpi = mpi
+            args.fillratio = fr
+            args.prefix = f"bench_fr{fr}_np{mpi}"
+
+            import time
+            inp_path = make_input(args)
+            t0 = time.time()
+            try:
+                run_decomp(args, inp_path)
+            except SystemExit:
+                # If it fails, record error
+                results.append({'mpi': mpi, 'fillratio': fr, 'time': None, 'error': True})
+                continue
+            elapsed = time.time() - t0
+            results.append({'mpi': mpi, 'fillratio': fr, 'time': elapsed, 'error': False})
+            print(f"  -> {elapsed:.1f}s")
+
+    print("\n" + "=" * 70)
+    print("  Benchmark Results")
+    print("=" * 70)
+    print(f"  {'MPI':>4s}  {'fillratio':>10s}  {'Time(s)':>10s}  {'Status':>10s}")
+    print("  " + "-" * 40)
+    best = None
+    for r in results:
+        status = "ERROR" if r['error'] else "OK"
+        print(f"  {r['mpi']:>4d}  {r['fillratio']:>10.2f}  {r['time'] if r['time'] else '----':>10}  {status:>10s}")
+        if not r['error'] and (best is None or r['time'] < best['time']):
+            best = r
+    if best:
+        print("  " + "-" * 40)
+        print(f"  BEST: MPI={best['mpi']}, fillratio={best['fillratio']}, {best['time']:.1f}s")
+        print(f"\n  Recommended: --mpi {best['mpi']} --fillratio {best['fillratio']}")
+    print("=" * 70)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +481,30 @@ def main():
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
+    # ---- Chain ID auto-detect ----
+    if args.chain is None:
+        args.chain = detect_chain_id(args.cr)
+    print(f"[CONFIG] Chain ID: {args.chain}")
+    print(f"[CONFIG] MPI={args.mpi}, fillratio={args.fillratio}, inp={args.inp}")
+    mem_active = args.memopt is not None and args.memopt == 1
+    if mem_active:
+        print(f"[CONFIG] Implicit membrane ON: emem={args.emem}, indi={args.indi}, "
+              f"exdi={args.exdi}, mctrdz={args.mctrdz}, mthick={args.mthick}, poretype={args.poretype}")
+    else:
+        print("[CONFIG] Implicit membrane: OFF")
+
+    # ---- Verify PB param consistency ----
+    if args.fillratio < 0.8:
+        print("[WARN] Very low fillratio (<0.8) may cause grid errors. Recommended: 1.0-2.0")
+    if args.fillratio > 3.0:
+        print("[WARN] High fillratio (>3.0) uses excessive memory. Recommended: 1.0-2.0")
+
+    # ---- Benchmark mode ----
+    if args.benchmark:
+        run_benchmark(args)
+        return
+
+    # ---- Normal mode ----
     print("=" * 60)
     print("  ASPB-IE Phase 1: WT per-residue decomposition scan")
     print("=" * 60)
