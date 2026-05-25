@@ -11,11 +11,29 @@
 [![Support](https://img.shields.io/badge/Support-Sourcery-orange)](https://sourcery.ai/invite/gndRrjlo)
 
 
-# Welcome to gmx_MMPBSA!
-gmx_MMPBSA is a new tool based on AMBER's MMPBSA.py aiming to perform end-state free energy calculations with GROMACS 
-files. It works with all GROMACS versions along with AmberTools >= 20.
+# gmx_MMPBSA-ASPB-IE
 
-**Please see the documentation [here](https://valdes-tresanco-ms.github.io/gmx_MMPBSA/dev/getting-started)**
+**GROMACS-native alanine scanning with WT cache.**
+
+ASPB-IE is an alanine scanning workflow designed for **GROMACS users**. All inputs are standard GROMACS
+format (`topol.top`, `md.tpr`, `md.xtc`, `index.ndx`). The tool converts GROMACS topologies to Amber
+internally via `cpptraj`/`tleap`, runs PB/IE evaluation with **sander (CPU only)**, and outputs per-mutation ΔΔG.
+
+> **You must have an existing MD trajectory (`.xtc`/`.trr`) before running.** The workflow does not
+> perform MD — it post-processes a completed trajectory for free energy analysis.
+
+---
+
+## Why this fork?
+
+| Problem | How ASPB-IE solves it |
+|---------|----------------------|
+| **Repeated WT calculation** — N mutations on same trajectory recompute WT N times | `normal_cache=1`: WT sander runs **once**, cached in `.wt_cache_snapshot_backup/` |
+| **File overwrite** — gmx_MMPBSA deletes/regenerates WT intermediates per mutation | `CopyCalc` + `parse_output_files` restore missing WT mdout from cache backup |
+| **Cache silently invalid** — frame range change gives wrong ΔΔG | Fingerprint stores `startframe`/`endframe` + file mtime; mismatch triggers full recompute |
+| **No hotspot discovery** — need a predefined residue list for alanine scanning | `wt_scan.py`: PB per-residue decomposition on WT trajectory predicts hotspots (Phase 1) |
+
+---
 
 ## Cite us
 
@@ -96,25 +114,70 @@ Two additional patches protect the **parse-output** phase when `normal_cache=1` 
    /
    ```
 
-## Cache validation
+## How WT cache prevents overwrite-driven recomputation
 
-The fingerprint stored in `.gmxmmpbsa_cache_info` includes:
+gmx_MMPBSA's internal `file_setup` deletes and recreates WT intermediate files (`*_pb.mdout.*`,
+`COM.prmtop`, etc.) for **each mutation run**. Without caching, every mutation on the same trajectory
+repeats the full WT sander calculation — even though the WT system never changes.
 
-| Field | Source | Purpose |
-|---|---|---|
-| `traj`, `tpr`, `top`, `index`, `ref_pdb` | mtime + size of input files | Detect swapped/modified input files |
-| `ala_template` | mtime + size of `ala.in` | Detect input parameter changes |
-| **`startframe`** | parsed from `ala.in` | Catch frame-skip changes |
-| **`endframe`** | parsed from `ala.in` | Catch frame-skip changes |
-| `mpi_size` | runner setting | Detect MPI rank count changes |
+### Three-layer overwrite protection
 
-If any field differs between the saved fingerprint and the current system, the cache is invalidated and a new full WT calculation runs. This ensures the cached WT mdout files always match the same trajectory frame range as the requested mutation.
+```
+Layer 1 — Backup (runner level)
+  vel_cache_runner.py / v5_mmpbsa_cal.py
+    ├─ backup_cache(): copies WT mdout → .wt_cache_snapshot_backup/ after first FULL run
+    └─ restore_cache(): restores backup before each CACHE run
 
-A standalone runner (`vel_cache_runner.py`) that orchestrates the FULL → CACHE → CACHE workflow is also available (see usage notes in that file).
+Layer 2 — CopyCalc fallback (calculation.py)
+  When copy(orig_name, final_name) fails because gmx_MMPBSA deleted the source:
+    → reads from .wt_cache_snapshot_backup/ instead
+
+Layer 3 — Parse restore (main.py)
+  When parse_output_files() can't find WT mdout for parsing:
+    → restores missing files from .wt_cache_snapshot_backup/
+```
+
+### Fingerprint validation
+
+Each cached run stores a `.gmxmmpbsa_cache_info` fingerprint:
+
+```json
+{
+  "traj": [1234567890, 52428800],
+  "tpr": [1234567890, 1048576],
+  "startframe": 1,
+  "endframe": 1000,
+  "mpi_size": 5
+}
+```
+
+If any field changes (e.g. you modify `ala.in` to skip frames), the cache **automatically invalidates**
+and the next run falls back to FULL. This ensures cached WT mdout always matches the current trajectory.
+
+### Usage
+
+Input files: `topol.top` + `md.tpr` + `md.xtc` + `index.ndx` + `ref.pdb` + `ala.in`
+
+```bash
+# Phase 1: WT decomposition scan (optional — only if you need hotspot discovery)
+python wt_scan.py \
+    --topol topol.top --tpr md.tpr --traj md.xtc \
+    --index index.ndx --cg "1 13" --cr ref.pdb \
+    --prefix MY_COMPLEX --top-n 20
+
+# Phase 2: alanine scanning with cache
+# First mutation does FULL (WT + mutant), subsequent mutations do CACHE (mutant only)
+python vel_cache_runner.py
+```
+```
 
 ---
 
 ## ASPB-IE: Alanine Scanning Poisson Boltzmann — Interaction Entropy
+
+> **GROMACS-native workflow.** Inputs are `topol.top`, `md.tpr`, `md.xtc`, `index.ndx`.
+> All PB calculations run on **CPU via sander** (no GPU required).
+> Requires an **existing MD trajectory** — the pipeline post-processes, it does not simulate.
 
 **ASPB-IE** is a two-stage end-state free energy workflow for identifying and quantifying hotspot residues in protein–ligand complexes when no prior mutation data is available.
 
@@ -213,3 +276,34 @@ To upgrade an existing conda environment:
 conda activate gmxMMPBSA
 pip install --upgrade --no-deps .
 ```
+
+### Runner deployment
+
+The `vel_cache_runner.py` and `wt_scan.py` scripts are **not part of the gmx_MMPBSA package**.
+They are standalone workflow orchestrators. Deploy them to any work directory:
+
+```bash
+# Copy runner to your work directory
+cp vel_cache_runner.py /path/to/project/
+cp wt_scan.py /path/to/project/
+
+# Edit these variables in vel_cache_runner.py:
+#   BASE      = Path('/path/to/project')
+#   SITES     = [21, 33, 68, 95]       # mutation residues
+#   MPI_SIZE  = 5                       # match -np in Slurm
+
+# Run
+python vel_cache_runner.py
+```
+
+### Deployment status (em server)
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| `input_parser.py` (normal_cache) | site-packages/GMXMMPBSA/ | ✅ deployed, tested |
+| `main.py` (skip normal + parse cache restore) | site-packages/GMXMMPBSA/ | ✅ deployed, tested |
+| `calculation.py` (CopyCalc fallback) | site-packages/GMXMMPBSA/ | ✅ deployed, tested |
+| `vel_cache_runner.py` | `/home/ajsali/lluoto/vel/` | ✅ deployed, job 25210991 completed |
+| `v5_mmpbsa_cal.py` | `/home/ajsali/lluoto/3070_0082_rp2/` | ✅ deployed (pre-`normal_cache` era data) |
+| `wt_scan.py` | `vel/` + `3070_0082_rp2/` | ✅ deployed, vel test passed |
+| `mutation_list.slurm` (CPU-only) | `/home/ajsali/lluoto/` | ✅ deployed `-p cpu`, `GMXMMPBSA_HYBRID_DISABLE=1` |
