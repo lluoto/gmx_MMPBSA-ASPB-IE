@@ -112,6 +112,91 @@ If any field differs between the saved fingerprint and the current system, the c
 
 A standalone runner (`vel_cache_runner.py`) that orchestrates the FULL → CACHE → CACHE workflow is also available (see usage notes in that file).
 
+---
+
+## ASPB-IE: Alanine Scanning Poisson Boltzmann — Interaction Entropy
+
+**ASPB-IE** is a two-stage end-state free energy workflow for identifying and quantifying hotspot residues in protein–ligand complexes when no prior mutation data is available.
+
+### Motivation
+
+Traditional alanine scanning requires a predefined list of candidate residues. When the protein is large or no hotspot information exists, scanning every residue is computationally prohibitive, while random selection risks missing key contributors.
+
+ASPB-IE solves this by using the wild-type (WT) trajectory itself to guide mutation selection.
+
+### Two-Stage Workflow
+
+```
+Phase 1                          Phase 2
+──────────                       ──────────
+WT complex  ─→ PB decomposition  →  Ranked       ─→ Alanine scanning
+(trajectory)    per-residue          hotspot           on hotspots
+                energy              candidates        (normal_cache=1)
+                                                    → ΔΔG per mutation
+```
+
+#### Phase 1 — WT Decomposition Scan
+
+Run PB decomposition on the **wild-type** complex to obtain per-residue binding energy contributions:
+
+```bash
+python wt_scan.py \
+    --topol topol.top --tpr md.tpr --traj md.xtc \
+    --index index.ndx --cg "1 13" --cr ref.pdb \
+    --prefix MY_COMPLEX --top-n 30 --threshold -1.0
+```
+
+This produces:
+
+| File | Content |
+|---|---|
+| `MY_COMPLEX_per_residue.csv` | Full per-residue PB decomposition (all residues, ranked by TOTAL) |
+| `MY_COMPLEX_hotspots.csv`    | Top N hotspot candidates (default: 20) |
+| `MY_COMPLEX_hotspots.ala`    | Ready-to-use `ala.in` template for Phase 2 |
+
+The script ranks residues by **TOTAL PB decomposition energy** (most negative = strongest binding contributor). Residues below `--threshold` (default -1.0 kcal/mol) or the top N are selected as candidate hotspots.
+
+#### Phase 2 — Targeted Alanine Scanning
+
+Use the generated `ala.in` template with the cache-aware runner:
+
+```bash
+python vel_cache_runner.py --ala MY_COMPLEX_hotspots.ala
+```
+
+The template already has `normal_cache=1` set, so the WT calculation runs only once (on the first mutation) and is reused for all subsequent mutations.
+
+### Method Details
+
+- **Poisson Boltzmann (PB)**: electrostatic solvation energy calculated with the PB model (`ipb=1`, `istrng=0.15`, `radiopt=0`).
+- **Interaction Entropy (IE)**: configurational entropy contribution estimated via the IE method from the trajectory ensemble.
+- **Decomposition**: per-residue energy decomposition (`idecomp=1`) decomposes the total PB binding energy into per-residue contributions.
+- **WT caching**: `normal_cache=1` skips redundant WT sander calculations across mutations on the same trajectory (see cache documentation above).
+
+### When to Use ASPB-IE
+
+| Scenario | Recommendation |
+|---|---|
+| Large protein, no known hotspots | Full ASPB-IE: Phase 1 → Phase 2 |
+| Known hotspots from literature | Skip Phase 1; directly configure `ala.in` for Phase 2 with `normal_cache=1` |
+| Validation of existing hotspots | Run Phase 2 only with a targeted `ala.in` |
+| Per-residue energy map desired | Phase 1 only (`--no-run` to generate input, or run and check `*_per_residue.csv`) |
+
+### Example: Running the Full Pipeline
+
+```bash
+# Phase 1: scan WT to find hotspots
+python wt_scan.py \
+    --topol topol.top --tpr md.tpr --traj md.xtc \
+    --index index.ndx --cg "1 13" --cr ref.pdb \
+    --prefix my_protein --top-n 15
+
+# Phase 2: alanine scan on found hotspots (using WT cache)
+python vel_cache_runner.py --ala my_protein_hotspots.ala
+```
+
+---
+
 ## Install this fork
 
 This version is **not** on PyPI/conda-forge. Install directly from source:
